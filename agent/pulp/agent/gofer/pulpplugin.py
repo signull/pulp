@@ -25,8 +25,6 @@ from M2Crypto.X509 import X509Error
 
 from gofer.decorators import *
 from gofer.agent.plugin import Plugin
-from gofer.messaging import Topic
-from gofer.messaging.producer import Producer
 from gofer.pmon import PathMonitor
 from gofer.agent.rmi import Context
 
@@ -38,9 +36,29 @@ from pulp.bindings.server import PulpConnection
 from pulp.bindings.bindings import Bindings
 
 log = getLogger(__name__)
+
+# this plugin
 plugin = Plugin.find(__name__)
+
+# the handler dispatcher
 dispatcher = Dispatcher()
-cfg = plugin.cfg()
+
+
+def _read_config():
+    """
+    Read the consumer configuration.
+    :return: The consumer configuration object.
+    :rtype: Config
+    """
+    paths = ['/etc/pulp/consumer/consumer.conf']
+    overrides = os.path.expanduser('~/.pulp/consumer.conf')
+    if os.path.exists(overrides):
+        paths.append(overrides)
+    return Config(*paths)
+
+# consumer configuration
+configuration = _read_config()
+cfg = configuration.graph()
 
 
 # --- utils ------------------------------------------------------------------
@@ -69,7 +87,8 @@ class ConsumerX509Bundle(Bundle):
     """
 
     def __init__(self):
-        Bundle.__init__(self, cfg.rest.clientcert)
+        path = os.path.join(cfg.filesystem.id_cert_dir, cfg.filesystem.id_cert_filename)
+        Bundle.__init__(self, path)
 
     def cn(self):
         """
@@ -91,9 +110,9 @@ class PulpBindings(Bindings):
     """
     
     def __init__(self):
-        host = cfg.rest.host
-        port = int(cfg.rest.port)
-        cert = cfg.rest.clientcert
+        host = cfg.server.host
+        port = int(cfg.server.port)
+        cert = os.path.join(cfg.filesystem.id_cert_dir, cfg.filesystem.id_cert_filename)
         connection = PulpConnection(host, port, cert_filename=cert)
         Bindings.__init__(self, connection)
 
@@ -120,12 +139,7 @@ class Conduit(HandlerConduit):
         :return: The consumer configuration object.
         :rtype: pulp.common.config.Config
         """
-        paths = ['/etc/pulp/consumer/consumer.conf']
-        overrides = os.path.expanduser('~/.pulp/consumer.conf')
-        if os.path.exists(overrides):
-            paths.append(overrides)
-        cfg = Config(*paths)
-        return cfg
+        return configuration
 
     def update_progress(self, report):
         """
@@ -149,46 +163,6 @@ class Conduit(HandlerConduit):
 
 # --- actions ----------------------------------------------------------------
 
-
-class Heartbeat:
-    """
-    Provide agent heartbeat.
-    """
-
-    __producer = None
-
-    @classmethod
-    def producer(cls):
-        """
-        Get the cached producer.
-        :return: A producer.
-        :rtype: Producer
-        """
-        if not cls.__producer:
-            broker = plugin.getbroker()
-            url = str(broker.url)
-            cls.__producer = Producer(url=url)
-        return cls.__producer
-
-    @remote
-    @action(seconds=cfg.heartbeat.seconds)
-    def send(self):
-        """
-        Send the heartbeat.
-        The delay defines when the next heartbeat
-        should be expected.
-        """
-        topic = Topic('heartbeat')
-        delay = int(cfg.heartbeat.seconds)
-        bundle = ConsumerX509Bundle()
-        consumer_id = bundle.cn()
-        if consumer_id:
-            p = self.producer()
-            body = dict(uuid=consumer_id, next=delay)
-            p.send(topic, ttl=delay, heartbeat=body)
-        return consumer_id
-
-
 class RegistrationMonitor:
     """
     Monitor the registration (consumer) certificate for changes.
@@ -210,7 +184,7 @@ class RegistrationMonitor:
         Start path monitor to track changes in the
         pulp identity certificate.
         """
-        path = cfg.rest.clientcert
+        path = os.path.join(cfg.filesystem.id_cert_dir, cfg.filesystem.id_cert_filename)
         cls.pmon.add(path, cls.changed)
         cls.pmon.start()
 
@@ -224,8 +198,13 @@ class RegistrationMonitor:
         :type path: str
         """
         log.info('changed: %s', path)
+        scheme = cfg.messaging.scheme
+        host = cfg.messaging.host or cfg.server.host
+        port = cfg.messaging.port
+        url = '%s://%s:%s' % (scheme, host, port)
         bundle = ConsumerX509Bundle()
         consumer_id = bundle.cn()
+        plugin.seturl(url)
         plugin.setuuid(consumer_id)
 
 
@@ -251,7 +230,7 @@ class Synchronization:
         """
         bundle = ConsumerX509Bundle()
         consumer_id = bundle.cn()
-        return (consumer_id is not None)
+        return consumer_id is not None
 
 # --- API --------------------------------------------------------------------
 
